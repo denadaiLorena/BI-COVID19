@@ -1,41 +1,46 @@
 import os
 import re
+import gc
+import pandas as pd
 from sqlalchemy import create_engine
 
 class BancoDeDados:
     def __init__(self):
         """
-        Configura as URLs de conexão. 
-        Mude o HOST, USER e PASSWORD para os dados do seu banco na nuvem (ex: Supabase/Aiven)
-        ou mantenha estes se conseguiu rodar o Postgres local.
+        Configura as conexões locais. 
+        Otimizado com NullPool para não reter cache de dados na memória RAM.
         """
         self.USER = "postgres"
         self.PASSWORD = "6794"
-        self.HOST = "localhost"  # Mude para o link da nuvem se necessário
+        self.HOST = "localhost"  
         self.PORT = "5432"
         
-        # URLs de conexão usando o driver correto do Postgres (psycopg2)
         self.url_postgres = f"postgresql+psycopg2://{self.USER}:{self.PASSWORD}@{self.HOST}:{self.PORT}/postgres"
         self.url_dw = f"postgresql+psycopg2://{self.USER}:{self.PASSWORD}@{self.HOST}:{self.PORT}/dw_covid"
         
-        # Cria as engines do SQLAlchemy
-        self.engine_init = create_engine(self.url_postgres)
-        self.engine_dw = create_engine(self.url_dw)
+        # Desliga o pool de conexões para liberar a RAM do Python imediatamente após cada query
+        from sqlalchemy.pool import NullPool
+        self.engine_init = create_engine(self.url_postgres, poolclass=NullPool)
+        self.engine_dw = create_engine(self.url_dw, poolclass=NullPool)
 
     def recriar_banco_dw(self):
-        """Passo 1: Derruba conexões presas e recria o banco 'dw_covid' do zero"""
+        """Passo 1: Remove o banco de dados de forma limpa e força a liberação de memória"""
         print("Passo 1: Gerenciando o Banco de Dados no Servidor...")
+        
+        self.engine_dw.dispose()
+        self.engine_init.dispose()
+        gc.collect()
+        
         try:
             with self.engine_init.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
                 dbapi_conn = conn.connection
                 with dbapi_conn.cursor() as cursor:
-                    # Força a queda de outras conexões para permitir o DROP
                     cursor.execute("""
                         SELECT pg_terminate_backend(pg_stat_activity.pid)
                         FROM pg_stat_activity
                         WHERE pg_stat_activity.datname = 'dw_covid' AND pid <> pg_backend_pid();
                     """)
-                    cursor.execute("DROP DATABASE IF EXISTS dw_covid;")
+                    cursor.execute("DROP DATABASE IF EXISTS dw_covid WITH (FORCE);")
                     cursor.execute("CREATE DATABASE dw_covid ENCODING 'UTF-8';")
                     print("[OK] Banco 'dw_covid' recriado com sucesso.")
                     return True
@@ -44,7 +49,6 @@ class BancoDeDados:
             return False
 
     def executar_script_snowflake(self, caminho_sql):
-
         """Passo 2 e 3: Lê o arquivo SQL, aplica a correção RegEx e executa no DW"""
         print("\nPasso 2: Lendo e corrigindo o arquivo estrutural do Snowflake...")
         
@@ -56,7 +60,6 @@ class BancoDeDados:
             with open(caminho_sql, "r", encoding="utf-8") as f:
                 sql_script = f.read()
             
-            # Correção cirúrgica via RegEx do campo de encerramento
             sql_script_corrigido = re.sub(
                 r"dataCamp_enc\s*:=\s*dataCamp_enc\s*,\s*dataencerramento", 
                 "dataencerramento", 
@@ -73,14 +76,75 @@ class BancoDeDados:
                     
         except Exception as e:
             print(f"\n[ERRO] Falha ao processar as tabelas ou carregar o CSV: {e}")
+        finally:
+            sql_script = None
+            sql_script_corrigido = None
+            gc.collect()
 
+    def salvar_dataframe(self, df, nome_tabela, if_exists='replace', schema=None):
+        """
+        Envia o DataFrame para a tabela no banco de dados usando COPY (bulk load),
+        muito mais rápido que INSERT linha a linha para grandes volumes de dados.
+
+        schema: nome do schema de destino (ex.: 'stg'). Se None, usa o schema
+        padrão da conexão (geralmente 'public').
+        """
+        import io
+        import csv
+        import numpy as np
+
+        df_copy = None
+        buffer = None
+        # Nome totalmente qualificado para o COPY (ex.: "stg"."notificacao_raw")
+        nome_qualificado = f'"{schema}"."{nome_tabela}"' if schema else f'"{nome_tabela}"'
+        try:
+            # 1. Cria a estrutura da tabela (0 linhas) via to_sql
+            df.head(0).to_sql(
+                name=nome_tabela,
+                con=self.engine_dw,
+                if_exists=if_exists,
+                index=False,
+                schema=schema
+            )
+
+            # 2. Troca NaN/None por nulo real e usa quoting completo para
+            #    proteger contra vírgulas, aspas ou quebras de linha dentro dos textos
+            df_copy = df.replace({np.nan: None})
+
+            buffer = io.StringIO()
+            df_copy.to_csv(
+                buffer,
+                index=False,
+                header=False,
+                sep=',',
+                quoting=csv.QUOTE_MINIMAL,
+                na_rep=''  # campo vazio = NULL no COPY com FORMAT csv
+            )
+            buffer.seek(0)
+
+            # 3. Bulk load via COPY
+            with self.engine_dw.connect() as conn:
+                dbapi_conn = conn.connection
+                with dbapi_conn.cursor() as cursor:
+                    cursor.copy_expert(
+                        f"""COPY {nome_qualificado} FROM STDIN WITH (
+                            FORMAT csv, DELIMITER ',', QUOTE '"', NULL ''
+                        )""",
+                        buffer
+                    )
+                dbapi_conn.commit()
+
+            print(f"[OK] Tabela {nome_qualificado} populada via COPY ({len(df_copy)} linhas).")
+        except Exception as e:
+            print(f"[ERRO] Falha ao salvar lote no banco: {e}")
+        finally:
+            del df_copy, buffer
+            import gc
+            gc.collect()
+
+            
     def processar_e_testar_data_mart(self, caminho_sql_mart):
-        """
-        Passo 1, 2, 3 e 4: Cria a Materialized View e compara a performance
-        da consulta Ad-hoc (Fato) contra o Data Mart utilizando EXPLAIN ANALYZE.
-        """
-        import os
-
+        """Passo 1, 2, 3 e 4: Cria a Materialized View e compara a performance"""
         print("Passo 1: Lendo o script de criação do Data Mart...")
         if not os.path.exists(caminho_sql_mart):
             print(f"[ERRO] O arquivo {caminho_sql_mart} não foi encontrado!")
@@ -89,67 +153,96 @@ class BancoDeDados:
         try:
             with open(caminho_sql_mart, "r", encoding="utf-8") as f:
                 sql_content = f.read()
-            
-            # Separa os comandos por ponto e vírgula
+
             comandos = [cmd.strip() for cmd in sql_content.split(";") if cmd.strip()]
-            
+
+            # Em vez de assumir posições fixas (comandos[0], [1], [2]...), identifica
+            # cada comando pelo conteúdo: queries marcadas com "-- EXPLAIN ANALYZE"
+            # vão para análise de performance; o restante (DROP/CREATE VIEW/INDEX) é DDL.
+            ddl_comandos = []
+            queries_explain = []
+
+            for cmd in comandos:
+                if re.search(r"--\s*EXPLAIN ANALYZE", cmd, flags=re.IGNORECASE):
+                    query_limpa = re.sub(r"--\s*EXPLAIN ANALYZE", "", cmd, flags=re.IGNORECASE).strip()
+                    queries_explain.append(query_limpa)
+                else:
+                    ddl_comandos.append(cmd)
+
+            # A query do Data Mart referencia o schema 'mart.'; a query da Fato não.
+            query_fato = next(q for q in queries_explain if "mart." not in q.lower())
+            query_mv = next(q for q in queries_explain if "mart." in q.lower())
+
             with self.engine_dw.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
                 dbapi_conn = conn.connection
                 with dbapi_conn.cursor() as cursor:
                     print("Passo 2: Criando a Materialized View e Índices...")
-                    # Executa os dois primeiros comandos (geralmente CREATE MATERIALIZED VIEW e CREATE INDEX)
-                    cursor.execute(comandos[0] + ";")
-                    cursor.execute(comandos[1] + ";")
+                    for ddl in ddl_comandos:
+                        cursor.execute(ddl + ";")
                     print("[OK] Materialized View criada com sucesso no schema 'mart'.")
-                    
-                    # --- AVALIAÇÃO EXPLAIN ANALYZE: MODELO AD-HOC (FATO) ---
+
                     print("\nPasso 3: Executando EXPLAIN ANALYZE na tabela Fato original (Ad-hoc)...")
-                    # Remove o comentário `-- EXPLAIN ANALYZE` caso ele exista no arquivo e força a execução do comando
-                    clean_query_fato = comandos[2].replace("-- EXPLAIN ANALYZE", "").strip()
-                    query_fato = f"EXPLAIN ANALYZE {clean_query_fato};"
-                    
-                    cursor.execute(query_fato)
+                    cursor.execute(f"EXPLAIN ANALYZE {query_fato};")
                     runtime_fato = cursor.fetchall()
                     print("--- RESULTADO FATO ---")
                     for line in runtime_fato:
                         print(line[0])
-                    
-                    # --- AVALIAÇÃO EXPLAIN ANALYZE: DATA MART (MV) ---
+
                     print("\nPasso 4: Executando EXPLAIN ANALYZE no Data Mart (Materialized View)...")
-                    clean_query_mv = comandos[3].replace("-- EXPLAIN ANALYZE", "").strip()
-                    query_mv = f"EXPLAIN ANALYZE {clean_query_mv};"
-                    
-                    cursor.execute(query_mv)
+                    cursor.execute(f"EXPLAIN ANALYZE {query_mv};")
                     runtime_mv = cursor.fetchall()
                     print("--- RESULTADO DATA MART ---")
                     for line in runtime_mv:
                         print(line[0])
-                        
+
         except Exception as e:
             print(f"\n[ERRO] Falha ao processar o Data Mart: {e}")
-
-    def salvar_dataframe(self, df, nome_tabela, if_exists='replace'):
-        """
-        Envia um DataFrame do Pandas direto para uma tabela no banco de dados.
-        """
-        try:
-            print(f"Enviando dados para a tabela '{nome_tabela}'...")
-            # Usando a engine_dw para salvar dentro do banco dw_covid
-            df.to_sql(name=nome_tabela, con=self.engine_dw, if_exists=if_exists, index=False)
-            print(f"[OK] Dados salvos com sucesso na tabela '{nome_tabela}'!")
-        except Exception as e:
-            print(f"[ERRO] Falha ao salvar no banco: {e}")
+        finally:
+            sql_content = None
+            comandos = None
+            gc.collect()
 
     def ler_tabela(self, nome_tabela):
-        """
-        Busca uma tabela do banco de dados e transforma de volta em um DataFrame.
-        """
         try:
             print(f"Buscando dados da tabela '{nome_tabela}'...")
-            df = pd.read_sql(f"SELECT * FROM {nome_tabela}", con=self.engine_dw)
-            return df
+            return pd.read_sql(f"SELECT * FROM {nome_tabela}", con=self.engine_dw)
         except Exception as e:
             print(f"[ERRO] Falha ao ler do banco: {e}")
             return None
-        
+
+    def ler_tabela_query(self, query):
+        try:
+            return pd.read_sql(query, self.engine_dw)
+        except Exception as e:
+            print(f"[ERRO] Falha ao executar a query: {e}")
+            return pd.DataFrame()
     
+    def executar_quality_gate(self, caminho_sql):
+        if not os.path.exists(caminho_sql):
+            print(f"[ERRO] O arquivo {caminho_sql} não foi encontrado!")
+            return
+
+        with open(caminho_sql, "r", encoding="utf-8") as f:
+            sql_procedure = f.read()
+
+        try:
+            with self.engine_dw.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+                dbapi_conn = conn.connection
+                with dbapi_conn.cursor() as cursor:
+                    print("Passo 2: Criando a Stored Procedure no banco...")
+                    cursor.execute(sql_procedure)
+                    print("[OK] Stored Procedure 'dw.sp_validar_qualidade_carga' criada.")
+
+                    print("\nPasso 3: Executando o Quality Gate (Validação)...")
+                    cursor.execute("CALL dw.sp_validar_qualidade_carga();")
+                    
+                    for notice in dbapi_conn.notices:
+                        print(f"Server Notice: {notice.strip()}")
+                    
+                    print("\n[SUCESSO] Dados validados. A carga da Fato está liberada!")
+        except Exception as e:
+            print(f"\n[BLOQUEADO] Carga interrompida pelo Quality Gate:")
+            print(f"Detalhe do Erro: {e}")
+        finally:
+            sql_procedure = None
+            gc.collect()

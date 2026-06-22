@@ -1,16 +1,14 @@
 """ETL: popula as dimensoes a partir de stg.notificacao_raw."""
 from sqlalchemy import create_engine, text
+# Importa a classe do seu arquivo database_connector.py
+from database_connector import BancoDeDados
 
-# Ajuste a senha se necessário
-ENGINE = create_engine(
-    "postgresql+psycopg2://postgres:6794@localhost:5432/dw_covid"
-)
+# Instancia a classe para utilizar a engine configurada
+db = BancoDeDados()
+engine = db.engine_dw
 
 def carregar_dimensao(nome_tabela, colunas_origem, colunas_destino):
-    """
-    Extrai combinacoes distintas da staging e insere na dimensao.
-    Usa ON CONFLICT DO NOTHING para idempotencia.
-    """
+    """Extrai combinacoes distintas da staging e insere na dimensao."""
     col_src = ", ".join(colunas_origem)
     col_dst = ", ".join(colunas_destino)
     sql = f"""
@@ -19,10 +17,13 @@ def carregar_dimensao(nome_tabela, colunas_origem, colunas_destino):
         FROM stg.notificacao_raw
         ON CONFLICT ({col_dst}) DO NOTHING;
     """
-    with ENGINE.begin() as conn:
+    # Utiliza a engine vinda da instância db
+    with engine.begin() as conn:
         conn.execute(text(sql))
     print(f"[OK] Dimensao {nome_tabela} carregada.")
 
+# --- As chamadas das funções permanecem iguais ---
+# ... (manter o restante do código conforme original)
 # --- DIM_LOCALIDADE ---
 carregar_dimensao(
     "dim_localidade",
